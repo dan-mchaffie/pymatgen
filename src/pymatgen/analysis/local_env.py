@@ -3774,7 +3774,7 @@ class CrystalNN(NearNeighbors):
 
     def __init__(
         self,
-        weighted_cn=False,
+        weighted_cn=True,
         cation_anion=False,
         distance_cutoffs=(0.5, 1),
         x_diff_weight=3.0,
@@ -3818,6 +3818,7 @@ class CrystalNN(NearNeighbors):
         self.porous_adjustment = porous_adjustment
         self.fingerprint_length = fingerprint_length
 
+
     @property
     def structures_allowed(self) -> bool:
         """
@@ -3850,7 +3851,6 @@ class CrystalNN(NearNeighbors):
                 the corresponding site in the original structure.
         """
         nn_data = self.get_nn_data(structure, n)
-
         if not self.weighted_cn:
             max_key = max(nn_data.cn_weights, key=lambda k: nn_data.cn_weights[k])
             nn = nn_data.cn_nninfo[max_key]
@@ -3912,8 +3912,8 @@ class CrystalNN(NearNeighbors):
         # adjust solid angle weight based on electronegativity difference
         if self.x_diff_weight > 0:
             for entry in nn:
-                X1 = structure[n].specie.X
-                X2 = entry["site"].specie.X
+                X1 = self._get_weighted_electronegativity(structure[n])
+                X2 = self._get_weighted_electronegativity(entry["site"])
 
                 if math.isnan(X1) or math.isnan(X2):
                     chemical_weight = 1
@@ -3922,6 +3922,11 @@ class CrystalNN(NearNeighbors):
                     chemical_weight = 1 + self.x_diff_weight * math.sqrt(abs(X1 - X2) / 3.3)
 
                 entry["weight"] = entry["weight"] * chemical_weight
+
+                total_occ = sum(entry["site"].species.values())
+                occupancy_weight = total_occ
+
+                entry["weight"] *= occupancy_weight
 
         # sort nearest neighbors from highest to lowest weight
         nn = sorted(nn, key=lambda x: x["weight"], reverse=True)
@@ -3935,9 +3940,9 @@ class CrystalNN(NearNeighbors):
 
         # adjust solid angle weights based on distance
         if self.distance_cutoffs:
-            r1 = _get_radius(structure[n])
+            r1 = _get_weighted_radius(structure[n])
             for entry in nn:
-                r2 = _get_radius(entry["site"])
+                r2 = _get_weighted_radius(entry["site"])
                 if r1 > 0 and r2 > 0:
                     diameter = r1 + r2
                 else:
@@ -3946,7 +3951,7 @@ class CrystalNN(NearNeighbors):
                         "covalent or atomic radii will be used, this can lead "
                         "to non-optimal results."
                     )
-                    diameter = _get_default_radius(structure[n]) + _get_default_radius(entry["site"])
+                    diameter = _get_default_weighted_radius(structure[n]) + _get_default_weighted_radius(entry["site"])
 
                 dist = np.linalg.norm(structure[n].coords - entry["site"].coords)
                 dist_weight: float = 0
@@ -4095,6 +4100,13 @@ class CrystalNN(NearNeighbors):
 
         return nn_data
 
+    def _get_weighted_electronegativity(self, site):
+        if site.is_ordered:
+            return site.specie.X
+        else:
+            total_amount = sum(site.species.values())
+            return sum(sp.X * (amt / total_amount) for sp, amt in site.species.items())
+
 
 def _get_default_radius(site) -> float:
     """
@@ -4110,6 +4122,46 @@ def _get_default_radius(site) -> float:
         return CovalentRadius.radius[site.specie.symbol]
     except Exception:
         return site.specie.atomic_radius
+
+
+def _get_default_weighted_radius(site) -> float:
+    """
+    An internal method to get a "default" covalent/element radius for a site,
+    taking into account multiple species if the site is disordered.
+
+    Args:
+        site (Site): The site for which to get the default radius.
+
+    Returns:
+        float: The weighted default covalent radius of elements on the site, or
+        the atomic radius if the covalent radius is unavailable. If the site is
+        ordered, returns the default radius directly.
+    """
+    if site.is_ordered:
+        return _get_default_radius(site)
+    else:
+        total_amount = sum(site.species.values())
+        weighted_default_radius = 0
+        for sp, amt in site.species.items():
+            weighted_default_radius += _get_default_specie_radius(sp) * (amt / total_amount)
+        return weighted_default_radius
+
+
+def _get_default_specie_radius(specie) -> float:
+    """
+    An internal method to get a "default" covalent/element radius for a single species.
+
+    Args:
+        specie (Specie): The species for which to get the default radius.
+
+    Returns:
+        float: The covalent radius of the element for the species, or the atomic radius
+        if the covalent radius is unavailable.
+    """
+    try:
+        return CovalentRadius.radius[specie.symbol]
+    except Exception:
+        return specie.atomic_radius
 
 
 def _get_radius(site):
@@ -4153,6 +4205,71 @@ def _get_radius(site):
             "the site oxidation states in the structure."
         )
     return 0
+
+
+def _get_specie_radius(specie):
+    """
+    An internal method to get the expected radius for a species with
+    oxidation state.
+
+    Args:
+        specie: (Specie)
+
+    Returns:
+        Oxidation-state dependent radius: ionic, covalent, or atomic.
+        Returns 0 if no oxidation state or appropriate radius is found.
+    """
+    if hasattr(specie, "oxi_state"):
+        el = specie.element
+        oxi = specie.oxi_state
+
+        if oxi == 0:
+            return _get_default_specie_radius(specie)
+
+        if oxi in el.ionic_radii:
+            return el.ionic_radii[oxi]
+
+        # e.g. oxi = 2.667, average together 2+ and 3+ radii
+        if math.floor(oxi) in el.ionic_radii and math.ceil(oxi) in el.ionic_radii:
+            oxi_low = el.ionic_radii[math.floor(oxi)]
+            oxi_high = el.ionic_radii[math.ceil(oxi)]
+            x = oxi - math.floor(oxi)
+            return (1 - x) * oxi_low + x * oxi_high
+
+        if oxi > 0 and el.average_cationic_radius > 0:
+            return el.average_cationic_radius
+
+        if el.average_anionic_radius > 0 > oxi:
+            return el.average_anionic_radius
+
+    else:
+        warnings.warn(
+            "No oxidation states specified on species! For better results, set "
+            "the species oxidation states in the structure."
+        )
+    return 0
+
+
+def _get_weighted_radius(site):
+    """
+    An internal method to get the weighted expected radius for a site with
+    multiple species and oxidation states.
+
+    Args:
+        site: (Site)
+
+    Returns:
+        Weighted oxidation-state dependent radius: ionic, covalent, or atomic.
+        Returns 0 if no oxidation state or appropriate radius is found.
+    """
+    if site.is_ordered:
+        return _get_radius(site)
+    else:
+        total_amount = sum(site.species.values())
+        weighted_radius = 0
+        for sp, amt in site.species.items():
+            weighted_radius += _get_specie_radius(sp) * (amt / total_amount)
+        return weighted_radius
 
 
 class CutOffDictNN(NearNeighbors):
